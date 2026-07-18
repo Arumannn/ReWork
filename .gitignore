@@ -1,0 +1,24 @@
+# Sensitive
+.env
+
+# Tool output
+subs/
+ports/
+http/
+urls/
+js/
+mobile/
+api/
+auth/
+correlation/
+github/
+dorks/
+
+# Reports
+recon_report.md
+
+# Phase markers
+.phase_*
+
+# Temp
+tmp/
