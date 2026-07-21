@@ -114,9 +114,9 @@ load_scope() {
   fi
 }
 
-# ── Collect & filter JS URLs ──────────────────────────────────────────────────
+# ── Collect & filter JS + JSON URLs ──────────────────────────────────────────
 collect_js_urls() {
-  log "Collecting JS URLs..."
+  log "Collecting JS & JSON URLs..."
   mkdir -p "$PROG_DIR"
   local all_js="${PROG_DIR}/js_urls_all.txt"
   local out="${PROG_DIR}/js_urls.txt"
@@ -127,28 +127,43 @@ collect_js_urls() {
     exit 1
   fi
 
-  grep -Ei '\.m?js(\?.*)?$' "$JS_SRC" | sort -u > "$all_js"
+  grep -Ei '\.(m?js|json)(\?.*)?$' "$JS_SRC" | sort -u > "$all_js"
 
   if [ "$DOMAINS" = ".*" ]; then
     cp "$all_js" "$out"
   else
-    grep -Ei "https?://[a-zA-Z0-9.-]*(${DOMAINS})" "$all_js" > "$out" 2>/dev/null || true
+    local scope_pat="${DOMAINS%\$}" delim='[/:?]'
+    grep -Ei "https?://[a-zA-Z0-9.-]*(${scope_pat})${delim}" "$all_js" > "$out" 2>/dev/null || true
+    grep -Ei "https?://[a-zA-Z0-9.-]*(${scope_pat})$" "$all_js" >> "$out" 2>/dev/null || true
+    sort -u "$out" -o "$out"
   fi
 
   local c; c=$(wc -l < "$out")
-  ok "JS URLs : ${c} in-scope (from $(wc -l < "$all_js") total JS)"
-  [ "$c" -eq 0 ] && { warn "0 in-scope JS — check scope / all_urls_merged.txt"; }
+  ok "JS/JSON URLs : ${c} in-scope (from $(wc -l < "$all_js") total)"
+  if [ "$c" -eq 0 ]; then
+    warn "0 in-scope — check scope / all_urls_merged.txt"
+  fi
 }
 
-# ── Download JS ───────────────────────────────────────────────────────────────
+# ── Download JS / JSON ─────────────────────────────────────────────────────────
 fetch_js() {
   local u="$1" prog_dir="$2" prog_map="$3"
+  local idx_dir="${prog_dir}/raw/.idx"
+  local url_hash; url_hash=$(printf '%s' "$u" | sha256sum | cut -c1-16)
+
+  [ -f "${idx_dir}/${url_hash}" ] && return 0
+
   local tmp; tmp=$(mktemp)
   sleep "$(awk "BEGIN{printf \"%.3f\", ${INTERVAL_MS}/1000 + ($RANDOM % 50)/1000}")"
 
+  local ext; ext=$(printf '%s' "$u" | grep -oP '\.(m?js|json)(\?|$)' | head -1 | tr -d '?')
+  [ -z "$ext" ] && ext=".js"
+  local accept; accept="application/${ext#.}, */*"
+  [ "$ext" = ".mjs" ] && accept="application/javascript, */*"
+
   local code
   code=$(curl -skL -A "$UA" \
-    -H "Accept: application/javascript, */*" \
+    -H "Accept: ${accept}" \
     "${AUTH_ARGS[@]}" \
     --max-time "$TIMEOUT" --compressed \
     -w '%{http_code}' -o "$tmp" "$u" 2>/dev/null)
@@ -156,9 +171,11 @@ fetch_js() {
   if [ "$code" = "200" ] && [ -s "$tmp" ] && \
      ! head -c 512 "$tmp" | grep -qiE '<!doctype html|<html\b'; then
     local h; h=$(sha256sum "$tmp" | cut -c1-16)
-    if [ ! -f "${prog_dir}/raw/${h}.js" ]; then
-      mv "$tmp" "${prog_dir}/raw/${h}.js"
+    local outfile="${prog_dir}/raw/${h}${ext}"
+    if [ ! -f "$outfile" ]; then
+      mv "$tmp" "$outfile"
     fi
+    touch "${idx_dir}/${url_hash}"
     (
       flock -x 200
       printf '%s\t%s\n' "$h" "$u" >> "$prog_map"
@@ -171,22 +188,53 @@ export -f fetch_js
 download_js() {
   local list="${PROG_DIR}/js_urls.txt"
   local map="${PROG_DIR}/url_map.tsv"
-  : > "$map"
+  local idx_dir="${PROG_DIR}/raw/.idx"
 
-  local total; total=$(wc -l < "$list")
-  [ "$total" -eq 0 ] && { warn "0 JS URLs, skipping download"; return; }
+  local total; total=$(wc -l < "$list" 2>/dev/null || echo 0)
+  if [ "$total" -eq 0 ]; then
+    warn "0 JS URLs, skipping download"; return
+  fi
 
-  mkdir -p "${PROG_DIR}/raw"
-  log "Downloading ${total} JS files (rate=${RATE_LIMIT}/s, parallel=${MAX_PARALLEL})..."
+  mkdir -p "$idx_dir"
+
+  # Rebuild URL index from existing map if index is empty/missing
+  if [ "$(ls "$idx_dir" 2>/dev/null | wc -l)" -eq 0 ] && [ -s "$map" ]; then
+    while IFS=$'\t' read -r _ u; do
+      local uh; uh=$(printf '%s' "$u" | sha256sum | cut -c1-16)
+      touch "${idx_dir}/${uh}"
+    done < "$map" 2>/dev/null || true
+  fi
+
+  # Count cached via URL index (fast, no map parsing)
+  local cached; cached=$(ls "$idx_dir" 2>/dev/null | wc -l || echo 0)
+
+  # Find new URLs — check URL-hash marker for each
+  local new_list="${PROG_DIR}/.new_js_urls.txt"
+  : > "$new_list"
+  while IFS= read -r u; do
+    [ -z "$u" ] && continue
+    local uh; uh=$(printf '%s' "$u" | sha256sum | cut -c1-16)
+    [ ! -f "${idx_dir}/${uh}" ] && echo "$u" >> "$new_list"
+  done < <(sort -u "$list") 2>/dev/null || true
+  local new_count; new_count=$(wc -l < "$new_list" 2>/dev/null || echo 0)
+
+  if [ "$new_count" -eq 0 ]; then
+    ok "All ${total} JS/JSON files already downloaded, skipping"
+    rm -f "$new_list"
+    return
+  fi
+
+  log "Downloading ${new_count}/${total} JS/JSON files (${cached} cached, rate=${RATE_LIMIT}/s, parallel=${MAX_PARALLEL})..."
 
   INTERVAL_MS="$INTERVAL_MS" TIMEOUT="$TIMEOUT" UA="$UA" RATE_LIMIT="$RATE_LIMIT" \
   AUTH_ARGS="${AUTH_ARGS[*]:-}" \
   xargs -P "$MAX_PARALLEL" -I{} bash -c "fetch_js '{}' '${PROG_DIR}' '${map}'" \
-    < "$list" 2>/dev/null || true
+    < "$new_list" 2>/dev/null || true
 
   sort -u "$map" -o "$map"
-  local dl; dl=$(ls "${PROG_DIR}/raw" 2>/dev/null | wc -l)
-  ok "Downloaded ${dl} unique JS files (deduplicated by sha256)"
+  rm -f "$new_list"
+  local dl; dl=$(ls "${PROG_DIR}/raw" 2>/dev/null | grep -v '/.idx$' | wc -l)
+  ok "Downloaded ${dl} unique files (deduplicated by sha256)"
 }
 
 # ── Source maps ───────────────────────────────────────────────────────────────
@@ -521,7 +569,7 @@ generate_report() {
 
 | Category | Count |
 |---|---|
-| JS files downloaded (dedup) | ${js_count} |
+| JS/JSON files downloaded (dedup) | ${js_count} |
 | Endpoints extracted | ${ep_count} |
 | Secret candidates (regex) | ${sec_count} |
 | Secret candidates (trufflehog) | ${sec_th} |

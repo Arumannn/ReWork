@@ -100,8 +100,8 @@ ${BOLD}PHASES:${RESET}
   3  Passive Mobile Recon    Static APK/IPA analysis
   4  Active Mobile Recon     Dynamic runtime analysis
   5  Web ↔ Mobile Correlation
-  6  Vulnerability Discovery Scanning
-  7  Reporting               Consolidated findings
+   6  (standalone: vulndiscovery.sh & js_analis.sh)
+   7  Reporting               Consolidated findings
 
 ${BOLD}.env FILE:${RESET}
   Copy .env.template to .env and fill in target details before running.
@@ -130,7 +130,7 @@ parse_args() {
         if [ -z "${2:-}" ] || ! [[ "$2" =~ ^[1-7]$ ]]; then
           crit "--phase requires a number between 1-7"; exit 1
         fi
-        START_PHASE="$2"; PHASE_EXPLICIT=true; shift 2 ;;
+        START_PHASE="$2"; RANGE_START="$2"; RANGE_END="$2"; PHASE_EXPLICIT=true; shift 2 ;;
       --resume) RESUME=true; shift ;;
       --range)
         if [ -z "${2:-}" ] || ! [[ "$2" =~ ^([1-7])-([1-7])$ ]]; then
@@ -206,13 +206,15 @@ load_env() {
   fi
 
   # Set defaults
-  : "${RL_LIGHT:=10}" "${RL_MEDIUM:=50}" "${RL_AGGRESSIVE:=100}" "${THREADS:=5}"
+  : "${RL_LIGHT:=10}" "${RL_MEDIUM:=50}" "${RL_AGGRESSIVE:=100}" "${MASSCAN_RATE:=1000}" "${THREADS:=5}"
+  : "${DNS_SERVER:=192.168.1.1}"
   : "${SCOPE_WILDCARD:=}" "${OUT_OF_SCOPE:=}"
   : "${WORKDIR:=${SCRIPT_DIR}}"
   : "${SEED_DOMAINS:=}"
   : "${TARGETS_FILE:=}"
   : "${GITHUB_TOKEN:=}"
   : "${SHODAN_API_KEY:=}"
+  : "${WORDLIST_DIR:=}"
 
   # Build auth args from env + CLI
   AUTH_ARGS=()
@@ -363,19 +365,16 @@ phase1_passive_web() {
     ok "  subfinder done: $(wc -l < subs/subfinder.txt 2>$NULL || echo 0)"
   fi
 
-  if command -v amass &>/dev/null; then
-    log "  Running amass intel..."
-    while read -r d; do
-      amass intel -whois -d "$d" 2>$NULL >> subs/amass_intel.txt || true
-    done < seeds.txt
-    sort -u subs/amass_intel.txt -o subs/amass_intel.txt 2>$NULL || true
-  fi
-
   log "  Certificate Transparency (crt.sh)..."
   while read -r d; do
-    curl -s --max-time 30 --retry 2 \
-      "https://crt.sh/?q=%25.${d}&output=json" 2>$NULL \
-      | jq -r '.[].name_value' 2>$NULL || true
+    resp=$(curl -s --max-time 30 --retry 2 \
+      -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0" \
+      "https://crt.sh/?q=%25.${d}&output=json" 2>$NULL) || true
+    case "$resp" in
+      '['*) echo "$resp" | jq -r '.[].name_value' 2>$NULL || true ;;
+      *)    warn "  crt.sh: ${d} returned non-JSON (rate-limited or down)" ;;
+    esac
+    sleep 0.5
   done < seeds.txt | sed 's/\*\.//g' >> subs/crtsh.txt || true
   sort -u subs/crtsh.txt -o subs/crtsh.txt 2>$NULL || true
 
@@ -388,10 +387,36 @@ phase1_passive_web() {
   sort -u subs/urlscan.txt -o subs/urlscan.txt 2>$NULL || true
 
   # Merge all subdomains
-  cat subs/subfinder.txt subs/crtsh.txt subs/amass_intel.txt subs/urlscan.txt \
+  cat subs/subfinder.txt subs/crtsh.txt subs/urlscan.txt \
     2>$NULL | sort -u >> subs/all_subs_raw.txt || true
   sort -u subs/all_subs_raw.txt -o subs/all_subs_raw.txt 2>$NULL || true
   ok "Total subdomains collected: $(wc -l < subs/all_subs_raw.txt 2>$NULL || echo 0)"
+
+  # ── 1.1b Shodan Recon ──
+  log "1.1b — Shodan Reconnaissance"
+  if command -v shodan &>/dev/null; then
+    while read -r d; do
+      shodan search "hostname:${d}" 2>$NULL >> subs/shodan_hosts.txt || true
+      shodan domain "$d" 2>$NULL >> subs/shodan_domain.txt || true
+    done < seeds.txt
+    sort -u subs/shodan_hosts.txt -o subs/shodan_hosts.txt 2>$NULL || true
+    ok "  Shodan: $(wc -l < subs/shodan_hosts.txt 2>$NULL || echo 0) findings"
+
+    log "  Generating pretty-printed Shodan output..."
+    sed 's/\\r\\n/\n/g; s/\\n/\n/g' subs/shodan_hosts.txt \
+      > subs/pretty_shodan_hosts.txt 2>$NULL || true
+    cp subs/shodan_domain.txt subs/pretty_shodan_domain.txt 2>$NULL || true
+    ok "  Pretty Shodan: subs/pretty_shodan_hosts.txt & pretty_shodan_domain.txt"
+
+    log "  Merging Shodan data into subdomain list..."
+    awk -F'\t' '{split($3, domains, /;/); for(d in domains) print domains[d]}' \
+      subs/shodan_hosts.txt 2>/dev/null >> subs/all_subs_raw.txt || true
+    awk '{print $1}' subs/shodan_domain.txt 2>/dev/null >> subs/all_subs_raw.txt || true
+    sort -u subs/all_subs_raw.txt -o subs/all_subs_raw.txt 2>/dev/null || true
+    ok "  Shodan subdomains merged: $(wc -l < subs/all_subs_raw.txt 2>/dev/null || echo 0) total"
+  else
+    warn "  shodan CLI not available — skipping"
+  fi
 
   # ── 1.2 Filter Scope ──
   log "1.2 — Filtering Scope"
@@ -414,12 +439,37 @@ phase1_passive_web() {
   sort -u subs/inscope_subs.txt -o subs/inscope_subs.txt 2>$NULL || true
   ok "In-scope subdomains: $(wc -l < subs/inscope_subs.txt 2>$NULL || echo 0)"
 
+  # ── 1.2b HTTP Probe on inscope_subs ──
+  log "1.2b — httpx-pd probe on inscope subdomains"
+  if command -v httpx-pd &>/dev/null; then
+    httpx-pd -l subs/inscope_subs.txt -rl "$RL_MEDIUM" -silent \
+      "${AUTH_ARGS[@]}" \
+      -sc -title -td -location -cl -server -probe -json \
+      2>$NULL > http/httpx_inscope.json || true
+    mkdir -p http/inscope_status
+    jq -r 'select(.status_code >= 100 and .status_code < 200) | .url' http/httpx_inscope.json \
+      2>$NULL | sort -u > http/inscope_status/sc_1xx.txt || true
+    jq -r 'select(.status_code >= 200 and .status_code < 300) | .url' http/httpx_inscope.json \
+      2>$NULL | sort -u > http/inscope_status/sc_2xx.txt || true
+    jq -r 'select(.status_code >= 300 and .status_code < 400) | .url' http/httpx_inscope.json \
+      2>$NULL | sort -u > http/inscope_status/sc_3xx.txt || true
+    jq -r 'select(.status_code >= 400 and .status_code < 500) | .url' http/httpx_inscope.json \
+      2>$NULL | sort -u > http/inscope_status/sc_4xx.txt || true
+    jq -r 'select(.status_code >= 500) | .url' http/httpx_inscope.json \
+      2>$NULL | sort -u > http/inscope_status/sc_5xx.txt || true
+    for f in http/inscope_status/sc_*.txt; do [ -s "$f" ] || rm -f "$f"; done
+    ok "  Inscope probe: 1xx=$(wc -l < http/inscope_status/sc_1xx.txt 2>$NULL || echo 0) 2xx=$(wc -l < http/inscope_status/sc_2xx.txt 2>$NULL || echo 0) 3xx=$(wc -l < http/inscope_status/sc_3xx.txt 2>$NULL || echo 0) 4xx=$(wc -l < http/inscope_status/sc_4xx.txt 2>$NULL || echo 0) 5xx=$(wc -l < http/inscope_status/sc_5xx.txt 2>$NULL || echo 0)"
+  else
+    warn "  httpx-pd not available — skipping inscope probe"
+  fi
+
   # ── 1.3 Historical URLs ──
   log "1.3 — Historical URL Gathering"
 
   if command -v gau &>/dev/null; then
-    log "  Running gau..."
-    gau -subs < seeds.txt 2>$NULL >> urls/gau.txt || true
+    log "  Running gau (timeout 120s)..."
+    timeout 120 gau --subs --providers wayback,otx < seeds.txt \
+      2>$NULL >> urls/gau.txt || warn "  gau timed out or failed"
     sort -u urls/gau.txt -o urls/gau.txt 2>$NULL || true
   fi
 
@@ -457,38 +507,46 @@ phase1_passive_web() {
   log "1.5 — Technology Fingerprinting"
 
   if command -v wafw00f &>/dev/null; then
-    log "  WAF detection via wafw00f..."
+    log "  WAF detection via wafw00f (resolve-checked)..."
+    : > http/waf_raw.txt
     while read -r h; do
-      wafw00f "https://${h}" -a 2>$NULL || true
-    done < <(head -20 subs/inscope_subs.txt 2>$NULL) \
-      >> http/waf_results.txt || true
+      dig +short @$DNS_SERVER "$h" A 2>$NULL | grep -q '^[0-9]' || continue
+      wafw00f "https://${h}" -a 2>/dev/null >> http/waf_raw.txt || true
+    done < <(head -20 subs/inscope_subs.txt 2>$NULL) || true
+    # Parse: extract URL → WAF status, sort with No WAF first
+    : > http/waf_summary.txt
+    current_url=""
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^\[+\]\ Checking\ (https?://[^ ]+) ]]; then
+        current_url="${BASH_REMATCH[1]}"
+      elif [[ "$line" =~ is\ behind\ (.*)\ WAF ]]; then
+        echo "${current_url} → ${BASH_REMATCH[1]} WAF" >> http/waf_summary.txt
+      elif [[ "$line" =~ No\ WAF ]]; then
+        echo "${current_url} → No WAF" >> http/waf_summary.txt
+      fi
+    done < http/waf_raw.txt
+    sort -u http/waf_summary.txt -o http/waf_summary.txt || true
+    grep "No WAF" http/waf_summary.txt > http/waf_tmp.txt 2>$NULL || true
+    grep -v "No WAF" http/waf_summary.txt >> http/waf_tmp.txt 2>$NULL || true
+    mv http/waf_tmp.txt http/waf_summary.txt 2>$NULL || true
+    ok "  WAF summary: http/waf_summary.txt ($(wc -l < http/waf_summary.txt) hosts)"
+    rm -f http/waf_raw.txt
   fi
 
   if command -v wappalyzer-cli &>/dev/null; then
-    log "  Tech detection via wappalyzer-cli..."
+    log "  Tech detection via wappalyzer-cli (resolve-checked)..."
     while read -r h; do
+      dig +short @$DNS_SERVER "$h" A 2>$NULL | grep -q '^[0-9]' || continue
       wappalyzer-cli -target "https://${h}" -silent 2>$NULL || true
     done < <(head -20 subs/inscope_subs.txt 2>$NULL) \
       >> http/wappalyzer_results.txt || true
-  fi
-
-  # ── 1.6 Shodan Recon ──
-  log "1.6 — Shodan Reconnaissance"
-  if command -v shodan &>/dev/null; then
-    while read -r d; do
-      shodan search "hostname:${d}" 2>$NULL >> subs/shodan_hosts.txt || true
-      shodan domain "$d" 2>$NULL >> subs/shodan_domain.txt || true
-    done < seeds.txt
-    sort -u subs/shodan_hosts.txt -o subs/shodan_hosts.txt 2>$NULL || true
-    ok "  Shodan: $(wc -l < subs/shodan_hosts.txt 2>$NULL || echo 0) findings"
-  else
-    warn "  shodan CLI not available — skipping"
   fi
 
   # ── 1.7 Google Dorking ──
   log "1.7 — Google Dork Generation"
   while read -r d; do
     cat >> dorks/google_dorks.txt <<EOF
+# ── individual ──
 site:${d} intitle:login
 site:${d} filetype:env
 site:${d} filetype:sql
@@ -509,6 +567,9 @@ site:${d} "secret"
 site:${d} "-----BEGIN"
 site:${d} "db_password"
 site:${d} "AWS_ACCESS_KEY"
+
+# ── all-in-one (OR) ──
+site:${d} (intitle:login OR filetype:env OR filetype:sql OR filetype:log OR inurl:admin OR inurl:api OR inurl:backup OR intitle:"index of" OR ext:json OR ext:xml OR ext:pdf OR "api_key" OR "secret" OR "token" OR "password" OR "db_password" OR "AWS_ACCESS_KEY" OR "-----BEGIN" OR "bucket" "s3")
 EOF
   done < seeds.txt
   ok "  Google dorks saved to dorks/google_dorks.txt ($(wc -l < dorks/google_dorks.txt) queries)"
@@ -517,20 +578,55 @@ EOF
   log "1.8 — GitHub Dorking"
   if [ -n "$GITHUB_TOKEN" ]; then
     mkdir -p github
-    while read -r d; do
-      local queries=("${d}+api+key" "${d}+secret" "${d}+token" "${d}+password" "${d}+.env")
-      for q in "${queries[@]}"; do
+    local kw
+    for kw in api_key secret password token .env AWS_ACCESS_KEY mongodb; do
+      # ── search seeds (domains) per-keyword ──
+      while read -r d; do
         curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
-          "https://api.github.com/search/code?q=${q}&per_page=50" 2>$NULL \
-          | jq -r '.items[]?.html_url' 2>$NULL >> github/leak_candidates.txt || true
+          -H "Accept: application/vnd.github.v3.text-match+json" \
+          "https://api.github.com/search/code?q=${d}+${kw}&per_page=100" 2>$NULL | \
+          jq -r --arg kw "$kw" --arg src "domain/${d}" \
+            '.items[]? | [.html_url, .repository.full_name, $kw, (.text_matches[0].fragment // "" | gsub("\\n"; " ") | .[0:200]), $src] | join(" | ")' \
+          2>$NULL >> github/leak_candidates.txt || true
+      done < seeds.txt
+
+      # ── search IP ranges from SCOPE_EXPLICIT ──
+      echo "$SCOPE_EXPLICIT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | sort -u | while read -r ip; do
+        [ -n "$ip" ] && curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github.v3.text-match+json" \
+          "https://api.github.com/search/code?q=${ip}+${kw}&per_page=100" 2>$NULL | \
+          jq -r --arg kw "$kw" --arg src "ip/${ip}" \
+            '.items[]? | [.html_url, .repository.full_name, $kw, (.text_matches[0].fragment // "" | gsub("\\n"; " ") | .[0:200]), $src] | join(" | ")' \
+          2>$NULL >> github/leak_candidates.txt || true
       done
-    done < seeds.txt
+
+      # ── search Azure tenants ──
+      echo "$SCOPE_EXPLICIT" | grep -oE '[a-zA-Z0-9_-]+\.onmicrosoft\.com' | sort -u | while read -r tenant; do
+        [ -n "$tenant" ] && curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github.v3.text-match+json" \
+          "https://api.github.com/search/code?q=${tenant}+${kw}&per_page=100" 2>$NULL | \
+          jq -r --arg kw "$kw" --arg src "azure/${tenant}" \
+            '.items[]? | [.html_url, .repository.full_name, $kw, (.text_matches[0].fragment // "" | gsub("\\n"; " ") | .[0:200]), $src] | join(" | ")' \
+          2>$NULL >> github/leak_candidates.txt || true
+      done
+
+      # ── search sharepoint URLs ──
+      echo "$SCOPE_EXPLICIT" | grep -oE 'https?://[a-zA-Z0-9.-]+\.sharepoint\.com' | sort -u | while read -r sp; do
+        [ -n "$sp" ] && curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github.v3.text-match+json" \
+          "https://api.github.com/search/code?q=${sp}+${kw}&per_page=100" 2>$NULL | \
+          jq -r --arg kw "$kw" --arg src "sp/${sp}" \
+            '.items[]? | [.html_url, .repository.full_name, $kw, (.text_matches[0].fragment // "" | gsub("\\n"; " ") | .[0:200]), $src] | join(" | ")' \
+          2>$NULL >> github/leak_candidates.txt || true
+      done
+    done
     sort -u github/leak_candidates.txt -o github/leak_candidates.txt 2>$NULL || true
     ok "  GitHub leak candidates: $(wc -l < github/leak_candidates.txt 2>$NULL || echo 0)"
   else
     log "  GITHUB_TOKEN not set — generating dork queries only"
     while read -r d; do
       cat >> dorks/github_dorks.txt <<EOF
+# ── individual ──
 "${d}" "api_key"
 "${d}" "secret"
 "${d}" "token"
@@ -541,6 +637,10 @@ EOF
 "${d}" "mongodb://"
 org:"${d}" password
 org:"${d}" secret
+
+# ── all-in-one (OR) ──
+"${d}" (api_key OR secret OR token OR password OR .env OR AWS_ACCESS_KEY OR "-----BEGIN RSA PRIVATE KEY" OR mongodb)
+org:"${d}" (password OR secret)
 EOF
     done < seeds.txt
     ok "  GitHub dorks saved to dorks/github_dorks.txt"
@@ -559,37 +659,59 @@ phase2_active_web() {
   fi
 
   # ── 2.1 DNS Resolution ──
-  log "2.1 — DNS Resolution"
-  while read -r h; do
-    ip=$(dig +short "$h" A 2>$NULL | grep -E '^[0-9]' | head -1)
-    [ -n "$ip" ] && echo "$h $ip" >> subs/resolved.txt
-  done < subs/inscope_subs.txt
+  log "2.1 — DNS Resolution (parallel, $THREADS threads)..."
+  total=$(wc -l < subs/inscope_subs.txt 2>$NULL || echo 0)
+  : > subs/resolved.txt
+  cat subs/inscope_subs.txt | xargs -P "$THREADS" -I{} sh -c '
+    ip=$(dig +short @$DNS_SERVER "{}" A 2>/dev/null | grep -E "^[0-9]" | head -1)
+    [ -n "$ip" ] && echo "{} $ip"
+  ' >> subs/resolved.txt 2>$NULL || true
   sort -u subs/resolved.txt -o subs/resolved.txt 2>$NULL || true
   awk '{print $1}' subs/resolved.txt 2>$NULL | sort -u >> subs/live_hosts.txt || true
   sort -u subs/live_hosts.txt -o subs/live_hosts.txt 2>$NULL || true
-  ok "Resolved IPs: $(wc -l < subs/resolved.txt 2>$NULL || echo 0)"
+  ok "Resolved: $(wc -l < subs/resolved.txt 2>$NULL || echo 0) / ${total} hosts"
 
   # ── 2.2 HTTP Probing ──
   log "2.2 — HTTP Probing"
   if command -v httpx-pd &>/dev/null; then
-    log "  httpx-pd with tech detection..."
-    httpx-pd -l subs/live_hosts.txt -rl "$RL_MEDIUM" -v \
-      "${AUTH_ARGS[@]}" \
-      -sc -title -td -location -cl -server -probe \
-      2>$NULL >> http/httpx_full.txt || true
-
-    log "  httpx-pd -tech (active subdomain check)..."
-    httpx-pd -l subs/live_hosts.txt -rl "$RL_MEDIUM" -silent \
-      "${AUTH_ARGS[@]}" -tech-detect \
-      2>$NULL >> http/httpx_tech.txt || true
-
+    log "  httpx-pd json probe..."
     httpx-pd -l subs/live_hosts.txt -rl "$RL_MEDIUM" -silent \
       "${AUTH_ARGS[@]}" \
-      2>$NULL >> http/live_urls.txt || true
+      -sc -title -td -location -cl -server -probe -json \
+      2>$NULL > http/httpx_full.json || true
 
-    sort -u http/live_urls.txt -o http/live_urls.txt 2>$NULL || true
-    sort -u http/httpx_full.txt -o http/httpx_full.txt 2>$NULL || true
+    log "  httpx-pd tech-detect (json)..."
+    httpx-pd -l subs/live_hosts.txt -rl "$RL_MEDIUM" -silent \
+      "${AUTH_ARGS[@]}" -tech-detect -json \
+      2>$NULL > http/httpx_tech.json || true
+
+    log "  Splitting by status code..."
+    jq -r '.url' http/httpx_full.json 2>$NULL | sort -u > http/live_urls.txt || true
+    jq -r 'select(.status_code >= 100 and .status_code < 200) | .url' http/httpx_full.json \
+      2>$NULL | sort -u > http/sc_1xx.txt || true
+    jq -r 'select(.status_code >= 200 and .status_code < 300) | .url' http/httpx_full.json \
+      2>$NULL | sort -u > http/sc_2xx.txt || true
+    jq -r 'select(.status_code >= 300 and .status_code < 400) | .url' http/httpx_full.json \
+      2>$NULL | sort -u > http/sc_3xx.txt || true
+    jq -r 'select(.status_code >= 400 and .status_code < 500) | .url' http/httpx_full.json \
+      2>$NULL | sort -u > http/sc_4xx.txt || true
+    jq -r 'select(.status_code >= 500) | .url' http/httpx_full.json \
+      2>$NULL | sort -u > http/sc_5xx.txt || true
+    for f in http/sc_*.txt; do [ -s "$f" ] || rm -f "$f"; done
+
+    # Copy status code results to url/status_code
+    mkdir -p url/status_code
+    for f in http/sc_*.txt; do
+      [ -s "$f" ] && cp "$f" "url/status_code/" 2>$NULL || true
+    done
+
     ok "  Live URLs: $(wc -l < http/live_urls.txt 2>$NULL || echo 0)"
+    ok "  Status split: 1xx=$(wc -l < http/sc_1xx.txt 2>$NULL || echo 0) 2xx=$(wc -l < http/sc_2xx.txt 2>$NULL || echo 0) 3xx=$(wc -l < http/sc_3xx.txt 2>$NULL || echo 0) 4xx=$(wc -l < http/sc_4xx.txt 2>$NULL || echo 0) 5xx=$(wc -l < http/sc_5xx.txt 2>$NULL || echo 0)"
+
+    # Create live_hosts_filtered.txt — exclude hosts that return 5xx only
+    jq -r 'select(.status_code < 500) | .input' http/httpx_full.json \
+      2>$NULL | sort -u > subs/live_hosts_filtered.txt || true
+    ok "  Live hosts filtered (excl 5xx): $(wc -l < subs/live_hosts_filtered.txt 2>$NULL || echo 0)"
   else
     warn "  httpx-pd not available — using curl probe"
     while read -r h; do
@@ -602,23 +724,8 @@ phase2_active_web() {
     sort -u http/live_urls.txt -o http/live_urls.txt 2>$NULL || true
   fi
 
-  # ── 2.3 Port Scanning ──
-  log "2.3 — Port Scanning"
-  awk '{print $2}' subs/resolved.txt | sort -u > ports/ips.txt
-  local PORTS="21,22,25,53,80,110,143,443,465,587,993,995,1080,2082,2083,3000,4443,5000,5432,6379,7001,8000,8008,8080,8081,8443,8888,9000,9200,11211,27017,30000"
-
-  if command -v nmap &>/dev/null; then
-    log "  Running nmap on resolved IPs..."
-    nmap -iL ports/ips.txt -p "$PORTS" -sV --open -T3 \
-      --max-retries 1 --host-timeout 3m --max-rate 10 -v \
-      -oA ports/nmap_all 2>$NULL || true
-    ok "  nmap scan complete"
-  else
-    warn "  nmap not available — skipping port scan"
-  fi
-
-  # ── 2.4 Web Crawling ──
-  log "2.4 — Web Crawling"
+  # ── 2.3 Web Crawling ──
+  log "2.3 — Web Crawling"
   if command -v katana &>/dev/null; then
     log "  Running katana..."
     katana -list http/live_urls.txt -rl "$RL_MEDIUM" -jc -c "$THREADS" \
@@ -638,34 +745,100 @@ phase2_active_web() {
 
   # Merge URLs
   cat urls/katana.txt urls/hakrawler.txt 2>$NULL | sort -u \
-    >> urls/all_urls_merged.txt || true
-  sort -u urls/all_urls_merged.txt -o urls/all_urls_merged.txt 2>$NULL || true
-  grep '=' urls/all_urls_merged.txt | sort -u >> urls/params_merged.txt || true
-  ok "Merged URLs: $(wc -l < urls/all_urls_merged.txt 2>$NULL || echo 0)"
+    >> urls/all_urls_final.txt || true
+  sort -u urls/all_urls_final.txt -o urls/all_urls_final.txt 2>$NULL || true
+  grep '=' urls/all_urls_final.txt | sort -u >> urls/params_merged.txt || true
+  ok "Merged URLs: $(wc -l < urls/all_urls_final.txt 2>$NULL || echo 0)"
+
+  # Merge all historical + live URLs
+  cat urls/all_urls.txt urls/all_urls_final.txt 2>$NULL | sort -u \
+    >> urls/all_urls_final.txt || true
+  ok "All URLs (historical + live): $(wc -l < urls/all_urls_final.txt 2>$NULL || echo 0)"
+
+  # Filter URLs by in-scope subdomains
+  grep -Ff subs/inscope_subs.txt urls/all_urls_final.txt \
+    | sort -u > urls/all_urls_final_inscope.txt || true
+  ok "In-scope URLs: $(wc -l < urls/all_urls_final_inscope.txt 2>$NULL || echo 0)"
+
+  # ── Status Code Check ──
+  log "  Checking status codes for all URLs..."
+  if command -v httpx-pd &>/dev/null; then
+    httpx-pd -l urls/all_urls_final_inscope.txt -rl "$RL_MEDIUM" -silent \
+      "${AUTH_ARGS[@]}" -sc -json \
+      2>$NULL > urls/httpx_all_urls.json || true
+
+    mkdir -p urls/status_code
+    jq -r 'select(.status_code >= 100 and .status_code < 200) | .url' urls/httpx_all_urls.json \
+      2>$NULL | sort -u > urls/status_code/sc_1xx.txt || true
+    jq -r 'select(.status_code >= 200 and .status_code < 300) | .url' urls/httpx_all_urls.json \
+      2>$NULL | sort -u > urls/status_code/sc_2xx.txt || true
+    jq -r 'select(.status_code >= 300 and .status_code < 400) | .url' urls/httpx_all_urls.json \
+      2>$NULL | sort -u > urls/status_code/sc_3xx.txt || true
+    jq -r 'select(.status_code >= 400 and .status_code < 500) | .url' urls/httpx_all_urls.json \
+      2>$NULL | sort -u > urls/status_code/sc_4xx.txt || true
+    jq -r 'select(.status_code >= 500) | .url' urls/httpx_all_urls.json \
+      2>$NULL | sort -u > urls/status_code/sc_5xx.txt || true
+    for f in urls/status_code/sc_*.txt; do [ -s "$f" ] || rm -f "$f"; done
+
+    # Extract URLs with 2xx/3xx/4xx status codes for extension extraction
+    jq -r 'select(.status_code >= 200 and .status_code < 500) | .url' urls/httpx_all_urls.json \
+      2>$NULL | sort -u > urls/urls_200_300_400.txt || true
+
+    ok "  Status codes: 1xx=$(wc -l < urls/status_code/sc_1xx.txt 2>$NULL || echo 0) 2xx=$(wc -l < urls/status_code/sc_2xx.txt 2>$NULL || echo 0) 3xx=$(wc -l < urls/status_code/sc_3xx.txt 2>$NULL || echo 0) 4xx=$(wc -l < urls/status_code/sc_4xx.txt 2>$NULL || echo 0) 5xx=$(wc -l < urls/status_code/sc_5xx.txt 2>$NULL || echo 0)"
+    ok "  URLs for extension extraction (2xx/3xx/4xx): $(wc -l < urls/urls_200_300_400.txt 2>$NULL || echo 0)"
+  fi
+
+  # Extract URLs by extension (only from 2xx/3xx/4xx URLs)
+  log "  Extracting URLs by extension..."
+  local ext_file="urls/all_urls_final_inscope.txt"
+  [ -s urls/urls_200_300_400.txt ] && ext_file="urls/urls_200_300_400.txt"
+  mkdir -p urls/by_ext
+  EXTENSIONS="js|json|xml|yml|yaml|php|asp|aspx|jsp|do|action|txt|conf|config|env|sql|bak|pdf|doc|xls|xlsx|docx|zip|tar|gz|rar|log|ini|cfg|cert|key|pem|csr|der"
+  local IFS='|'
+  for ext in $EXTENSIONS; do
+    grep -i "\.${ext}\b" "$ext_file" \
+      > "urls/by_ext/ext_${ext}.txt" 2>$NULL || true
+    local cnt=$(wc -l < "urls/by_ext/ext_${ext}.txt" 2>$NULL || echo 0)
+    [ "$cnt" -gt 0 ] && log "    .${ext}: ${cnt} URLs"
+  done
+  unset IFS
 
   # ── 2.5 Content Discovery ──
   log "2.5 — Content Discovery"
   local WORDS="api|v1|v2|v3|graphql|rest|auth|login|signin|oauth|token|session|user|admin|internal|dashboard|health|status|metrics|swagger|docs|openapi|webhook|callback|config|settings|payment|checkout|wallet|static|assets|uploads|download|.env|.git|backup|db|migrations|logs|debug|test"
 
   if command -v ffuf &>/dev/null; then
-    log "  Running ffuf content discovery..."
+    log "  Running ffuf fast scan (inline wordlist)..."
     while read -r h; do
       ffuf -u "https://${h}/FUZZ" -w <(echo "$WORDS" | tr '|' '\n') \
         -t "$THREADS" -rate "$RL_AGGRESSIVE" -c -fc 404 \
         2>$NULL >> http/ffuf_results.txt || true
     done < <(head -20 subs/live_hosts.txt 2>$NULL)
     sort -u http/ffuf_results.txt -o http/ffuf_results.txt 2>$NULL || true
-    ok "  FFuf results: $(wc -l < http/ffuf_results.txt 2>$NULL || echo 0)"
-  fi
+    ok "  FFuf fast scan done: $(wc -l < http/ffuf_results.txt 2>$NULL || echo 0) results"
 
-  if command -v feroxbuster &>/dev/null; then
-    log "  Running feroxbuster..."
-    while read -r h; do
-      feroxbuster -u "https://${h}" -w <(echo "$WORDS" | tr '|' '\n') \
-        -t "$THREADS" --rate-limit "$RL_MEDIUM" --silent \
-        2>$NULL >> http/feroxbuster_results.txt || true
-    done < <(head -10 subs/live_hosts.txt 2>$NULL)
-    sort -u http/feroxbuster_results.txt -o http/feroxbuster_results.txt 2>$NULL || true
+    # Full scan with wordlist
+    local full_wordlist=""
+    if [ -n "$WORDLIST_DIR" ] && [ -f "$WORDLIST_DIR/common.txt" ]; then
+      full_wordlist="$WORDLIST_DIR/common.txt"
+    elif [ -f /usr/share/wordlists/dirb/common.txt ]; then
+      full_wordlist=/usr/share/wordlists/dirb/common.txt
+    elif [ -f /usr/share/seclists/Discovery/Web-Content/common.txt ]; then
+      full_wordlist=/usr/share/seclists/Discovery/Web-Content/common.txt
+    fi
+
+    if [ -n "$full_wordlist" ]; then
+      log "  Running ffuf full scan ($full_wordlist)..."
+      while read -r h; do
+        ffuf -u "https://${h}/FUZZ" -w "$full_wordlist" \
+          -t "$THREADS" -rate "$RL_MEDIUM" -c -fc 404 \
+          2>$NULL >> http/ffuf_full_results.txt || true
+      done < <(head -10 subs/live_hosts.txt 2>$NULL)
+      sort -u http/ffuf_full_results.txt -o http/ffuf_full_results.txt 2>$NULL || true
+      ok "  FFuf full scan done: $(wc -l < http/ffuf_full_results.txt 2>$NULL || echo 0) results"
+    else
+      log "  No external wordlist found — skipping full scan (install seclists or set WORDLIST_DIR)"
+    fi
   fi
 
   # ── 2.6 Hidden Parameter Discovery ──
@@ -675,7 +848,7 @@ phase2_active_web() {
     while read -r ep; do
       arjun -u "$ep" --method GET --threads 5 --rate-limit "$RL_LIGHT" \
         2>$NULL >> api/arjun_params.txt || true
-    done < <(head -30 urls/api_urls.txt 2>$NULL)
+    done < <(head -30 urls/all_urls_final_inscope.txt 2>$NULL)
     sort -u api/arjun_params.txt -o api/arjun_params.txt 2>$NULL || true
   fi
 
@@ -692,19 +865,40 @@ phase3_mobile_passive() {
     log "3.1 — Android APK Analysis"
     mkdir -p mobile/android/{decompiled,source,reports}
 
+    # Try pull APK from connected device via adb
+    if command -v adb &>/dev/null && adb get-state 2>$NULL | grep -q device; then
+      log "  Connected device detected — pulling APKs via adb..."
+      for pkg in $ANDROID_PACKAGES; do
+        local apk_path="mobile/android/${pkg}.apk"
+        local remote_path
+        remote_path=$(adb shell pm path "$pkg" 2>$NULL | sed 's/^package://' | head -1)
+        if [ -n "$remote_path" ]; then
+          ok "  Pulling ${pkg} from device (${remote_path})..."
+          adb pull "$remote_path" "$apk_path" 2>$NULL || true
+        else
+          warn "  Package ${pkg} not found on device"
+        fi
+      done
+    else
+      log "  No adb device — skipping APK pull"
+    fi
+
     for pkg in $ANDROID_PACKAGES; do
+      local apk_abs="${WORKDIR}/mobile/android/${pkg}.apk"
+      local decomp_abs="${WORKDIR}/mobile/android/decompiled/${pkg}"
+      local source_abs="${WORKDIR}/mobile/android/source/${pkg}"
       local apk_path="mobile/android/${pkg}.apk"
-      [ ! -f "$apk_path" ] && warn "  APK not found: ${apk_path}" && continue
+      [ ! -f "$apk_abs" ] && warn "  APK not found: ${apk_abs}" && continue
 
       if command -v apktool &>/dev/null; then
         log "  Decompiling ${pkg} with apktool..."
-        apktool d -f -o "mobile/android/decompiled/${pkg}" "$apk_path" \
+        apktool d -f -o "$decomp_abs" "$apk_abs" \
           2>$NULL || true
       fi
 
       if command -v jadx &>/dev/null; then
         log "  Decompiling ${pkg} with jadx..."
-        jadx -d "mobile/android/source/${pkg}" "$apk_path" 2>$NULL || true
+        jadx -d "$source_abs" "$apk_abs" 2>$NULL || true
       fi
 
       log "  Extracting URLs from ${pkg}..."
@@ -714,7 +908,8 @@ phase3_mobile_passive() {
       sort -u "mobile/android/urls_${pkg}.txt" -o "mobile/android/urls_${pkg}.txt" 2>$NULL || true
 
       log "  Extracting secrets from ${pkg}..."
-      strings "$apk_path" | grep -iE 'api[_-]?key|token|secret|password|bearer|firebase|supabase' \
+      strings "$apk_path" | grep -iE \
+'api[_-]?key|token|secret|password|bearer|firebase|supabase|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]+\.eyJ|-----BEGIN.*(RSA|EC|DSA|PRIVATE)|sk_live_|pk_live_|TWILIO|xox[baprs]-|postgresql://|mysql://|mongodb://|redis://' \
         >> "mobile/android/secrets_${pkg}.txt" || true
       sort -u "mobile/android/secrets_${pkg}.txt" -o "mobile/android/secrets_${pkg}.txt" 2>$NULL || true
 
@@ -819,92 +1014,28 @@ phase5_correlation() {
   ok "Phase 5 — Correlation complete!"
 }
 
-# ── Phase 6: Vulnerability Discovery ──────────────────────────────────────────
-phase6_vulnerability() {
-  header "Phase 6 — Vulnerability Discovery"
+# ── Phase 6: Standalone Scripts ───────────────────────────────────────────────
+phase6_standalone() {
+  header "Phase 6 — Standalone Recon Scripts"
+  cat <<EOF
 
-  if [ ! -f http/live_urls.txt ] || [ ! -s http/live_urls.txt ]; then
-    crit "No live URLs found. Run Phase 2 first."; return 1
-  fi
+  The following scripts should be run separately after Phase 2 completes.
+  They are NOT included in the main pipeline — run them manually when ready.
 
-  # ── 6.1 Subdomain Takeover ──
-  log "6.1 — Subdomain Takeover Check"
-  if command -v nuclei &>/dev/null; then
-    nuclei -l http/live_urls.txt -tags takeover -rl "$RL_MEDIUM" \
-      -severity medium,high,critical "${AUTH_ARGS[@]}" \
-      2>$NULL >> http/takeover.txt || true
-    sort -u http/takeover.txt -o http/takeover.txt 2>$NULL || true
-    ok "  Takeover findings: $(wc -l < http/takeover.txt 2>$NULL || echo 0)"
-  fi
+  ====================================================================
+  1.  bash portscan.sh              Port scanning
+                                    (masscan + nmap, requires root)
 
-  # ── 6.2 CVE & Misconfig ──
-  log "6.2 — CVE & Misconfig Scanning"
-  if command -v nuclei &>/dev/null; then
-    nuclei -l http/live_urls.txt \
-      -tags exposure,misconfig,cve,config,backup,disclosure \
-      -exclude-tags ssl,tls,dos,fuzz,intrusive,token-spray,creds-stuffing,brute-force \
-      -severity medium,high,critical -exclude-severity info \
-      -rl "$RL_MEDIUM" "${AUTH_ARGS[@]}" \
-      2>$NULL >> http/nuclei_findings.txt || true
-    sort -u http/nuclei_findings.txt -o http/nuclei_findings.txt 2>$NULL || true
-    ok "  Nuclei findings: $(wc -l < http/nuclei_findings.txt 2>$NULL || echo 0)"
-  fi
+  2.  bash js_analis.sh <workdir>   JS/JSON analysis pipeline
+                                    (download, endpoints, secrets, XSS, etc.)
 
-  # ── 6.3 CORS Misconfiguration ──
-  log "6.3 — CORS Misconfiguration"
-  if command -v nuclei &>/dev/null; then
-    nuclei -l http/live_urls.txt -tags cors -rl "$RL_MEDIUM" \
-      2>$NULL >> http/cors_findings.txt || true
-  fi
+  3.  bash vulndiscovery.sh         Vulnerability discovery
+                                    (takeover, CVE, CORS, XSS, SQLi, API audit)
+  ====================================================================
 
-  for target in $(head -10 subs/live_hosts.txt 2>$NULL); do
-    for origin in "https://evil.com" "https://${target}.evil.com" "null"; do
-      curl -sk "https://${target}/" -H "Origin: $origin" -I \
-        2>$NULL | grep -i 'access-control' >> http/cors_manual.txt || true
-    done
-  done
-  sort -u http/cors_findings.txt -o http/cors_findings.txt 2>$NULL || true
-  ok "  CORS checks done"
-
-  # ── 6.4 Open Redirect ──
-  log "6.4 — Open Redirect"
-  grep -oE 'https?://[^"'"'"'<> ]*(redirect|return|continue|next|url|goto|dest|target)=https?://' \
-    urls/all_urls_merged.txt >> urls/open_redirect_candidates.txt 2>$NULL || true
-  sort -u urls/open_redirect_candidates.txt -o urls/open_redirect_candidates.txt 2>$NULL || true
-  ok "  Open redirect candidates: $(wc -l < urls/open_redirect_candidates.txt 2>$NULL || echo 0)"
-
-  # ── 6.5 XSS Scanning ──
-  log "6.5 — XSS Scanning"
-  if command -v dalfox &>/dev/null; then
-    head -100 urls/params_merged.txt 2>$NULL \
-      | dalfox pipe --mining-dom --mining-dict --rate-limit "$RL_LIGHT" \
-        2>$NULL >> http/xss_findings.txt || true
-    sort -u http/xss_findings.txt -o http/xss_findings.txt 2>$NULL || true
-    ok "  XSS findings: $(wc -l < http/xss_findings.txt 2>$NULL || echo 0)"
-  fi
-
-  # ── 6.6 SQL Injection ──
-  log "6.6 — SQL Injection"
-  if command -v sqlmap &>/dev/null; then
-    head -10 urls/params_merged.txt 2>$NULL \
-      | xargs -I{} sqlmap -u "{}" --batch --level=1 --risk=1 \
-        --random-agent --output-dir=api/sqlmap 2>$NULL || true
-    ok "  SQLMap scan complete"
-  fi
-
-  # ── 6.7 API Security Audit ──
-  log "6.7 — API Security Audit"
-  if [ -f urls/api_urls.txt ] && [ -s urls/api_urls.txt ]; then
-    if command -v nuclei &>/dev/null; then
-      nuclei -l urls/api_urls.txt -tags api,graphql,jwt \
-        -rl "$RL_LIGHT" "${AUTH_ARGS[@]}" \
-        2>$NULL >> http/api_vulns.txt || true
-      sort -u http/api_vulns.txt -o http/api_vulns.txt 2>$NULL || true
-    fi
-    ok "  API security checks done"
-  fi
-
-  ok "Phase 6 — Vulnerability Discovery complete!"
+EOF
+  ok "Phase 6 — Standalone instructions shown. Run each script separately."
+  mark_phase_done 6
 }
 
 # ── Phase 7: Reporting ────────────────────────────────────────────────────────
@@ -918,7 +1049,7 @@ phase7_reporting() {
 # Recon Report — ${PROGRAM_NAME:-$PROGRAM}
 **Generated:** ${ts}
 
-## Surface Summary
+## Surface Summary (recon_framework.sh)
 
 | Metric | Count |
 |--------|-------|
@@ -926,23 +1057,42 @@ phase7_reporting() {
 | Subdomains (all) | $(wc -l < subs/all_subs_raw.txt 2>$NULL || echo 0) |
 | Subdomains (in-scope) | $(wc -l < subs/inscope_subs.txt 2>$NULL || echo 0) |
 | Live hosts | $(wc -l < subs/live_hosts.txt 2>$NULL || echo 0) |
+| Live hosts (filtered, excl 5xx) | $(wc -l < subs/live_hosts_filtered.txt 2>$NULL || echo 0) |
 | Live URLs | $(wc -l < http/live_urls.txt 2>$NULL || echo 0) |
 | URLs w/ params | $(wc -l < urls/params_merged.txt 2>$NULL || echo 0) |
+| In-scope URLs | $(wc -l < urls/all_urls_final_inscope.txt 2>$NULL || echo 0) |
 | Historical URLs | $(wc -l < urls/all_urls.txt 2>$NULL || echo 0) |
 | JS URLs | $(wc -l < urls/js_urls.txt 2>$NULL || echo 0) |
 | Mobile endpoints | $(wc -l < mobile/all_mobile_endpoints.txt 2>$NULL || echo 0) |
 
-## Vulnerability Findings
+## Port Scanning (portscan.sh)
 
-| Category | Count |
-|----------|-------|
+| Metric | Count |
+|--------|-------|
+| Open ports found | $(wc -l < ports/open_ports_raw.txt 2>$NULL || echo 0) |
+| IPs scanned | $(wc -l < ports/ips.txt 2>$NULL || echo 0) |
+
+## JS Analysis (js_analis.sh)
+
+| Metric | Count |
+|--------|-------|
+| JS/JSON files | $(ls js/raw 2>/dev/null | wc -l || echo 0) |
+| Endpoints extracted | $(wc -l < js/findings/endpoints/all.txt 2>$NULL || echo 0) |
+| Secret candidates | $(wc -l < js/findings/secrets/hits_filtered.txt 2>$NULL || echo 0) |
+| XSS sinks | $(wc -l < js/findings/xss/dangerous_sinks.txt 2>$NULL || echo 0) |
+
+## Vulnerability Discovery (vulndiscovery.sh)
+
+| Metric | Count |
+|--------|-------|
 | Takeover candidates | $(wc -l < http/takeover.txt 2>$NULL || echo 0) |
 | Nuclei findings | $(wc -l < http/nuclei_findings.txt 2>$NULL || echo 0) |
 | CORS findings | $(wc -l < http/cors_findings.txt 2>$NULL || echo 0) |
 | XSS findings | $(wc -l < http/xss_findings.txt 2>$NULL || echo 0) |
-| Open redirects | $(wc -l < urls/open_redirect_candidates.txt 2>$NULL || echo 0) |
+| Open redirect candidates | $(wc -l < urls/open_redirect_candidates.txt 2>$NULL || echo 0) |
+| API vulns | $(wc -l < http/api_vulns.txt 2>$NULL || echo 0) |
 
-## Correlation
+## Correlation (Phase 5)
 
 | Category | Count |
 |----------|-------|
@@ -951,23 +1101,17 @@ phase7_reporting() {
 | Shared endpoints | $(wc -l < correlation/shared_endpoints.txt 2>$NULL || echo 0) |
 | Combined secrets | $(wc -l < correlation/all_secrets.txt 2>$NULL || echo 0) |
 
+## Standalone Scripts
+
+The following scripts should be run separately:
+- \`bash portscan.sh\` — Port scanning (masscan + nmap, requires root)
+- \`bash js_analis.sh <workdir> [scope]\` — JS analysis pipeline
+- \`bash vulndiscovery.sh\` — Vulnerability scanning (takeover, CVE, XSS, SQLi, etc.)
+
 EOF
 
   ok "Report appended to recon_report.md"
   ok "Phase 7 — Reporting complete!"
-}
-
-# ── Run JS Analysis ───────────────────────────────────────────────────────────
-run_js_analysis() {
-  local js_script="${SCRIPT_DIR}/js_analis.sh"
-  if [ -f "$js_script" ] && [ -x "$js_script" ] || [ -f "$js_script" ]; then
-    log "Running JS analysis via js_analis.sh..."
-    bash "$js_script" "$WORKDIR" "$SCOPE_WILDCARD" || true
-    ok "JS analysis complete"
-  else
-    warn "js_analis.sh not found at ${js_script} — skipping JS analysis"
-    warn "You can run it separately: bash js_analis.sh <workdir>"
-  fi
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1005,9 +1149,10 @@ main() {
 
   # ── Resume: skip completed phases ──
   if [ "$RESUME" = true ] && [ "$PHASE_EXPLICIT" = false ]; then
-    for n in 1 2 3 4 5 6 7; do
+    for n in 1 2 3 4 5 7; do
       if ! phase_is_done "$n"; then
         START_PHASE=$n
+        RANGE_START=$n
         dbg "Resume mode: starting from Phase $n (previous phases already done)"
         break
       fi
@@ -1021,33 +1166,13 @@ main() {
 
   check_tools
 
-  case "$START_PHASE" in
-    1) should_run_phase 1 && phase1_passive_web       ;;&
-    2) should_run_phase 2 && phase2_active_web        ;;&
-    3) should_run_phase 3 && phase3_mobile_passive    ;;&
-    4) should_run_phase 4 && phase4_mobile_active     ;;&
-    5) should_run_phase 5 && phase5_correlation       ;;&
-    6)
-      if should_run_phase 6; then
-        # Run JS analysis before vuln discovery if applicable
-        if [ "$START_PHASE" -le 2 ] || [ "$RANGE_START" -le 2 ]; then
-          run_js_analysis
-        fi
-        phase6_vulnerability
-      fi
-      ;;
-    7) should_run_phase 7 && phase7_reporting         ;;
-    *)
-      phase1_passive_web
-      phase2_active_web
-      run_js_analysis
-      phase3_mobile_passive
-      phase4_mobile_active
-      phase5_correlation
-      phase6_vulnerability
-      phase7_reporting
-      ;;
-  esac
+  should_run_phase 1 && phase1_passive_web
+  should_run_phase 2 && phase2_active_web
+  should_run_phase 3 && phase3_mobile_passive
+  should_run_phase 4 && phase4_mobile_active
+  should_run_phase 5 && phase5_correlation
+  should_run_phase 6 && phase6_standalone
+  should_run_phase 7 && phase7_reporting
 
   echo ""
   echo -e "${BOLD}${GREEN}════════════════════════════════════════════════${RESET}"
