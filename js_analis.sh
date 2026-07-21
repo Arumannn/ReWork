@@ -49,7 +49,7 @@ RATE_LIMIT=$RL_MEDIUM
 INTERVAL_MS=$((1000 / RATE_LIMIT))
 
 PROG_DIR="${WORKDIR}/js"
-JS_SRC="${WORKDIR}/urls/all_urls_merged.txt"
+JS_SRC="${WORKDIR}/urls/all_urls_final.txt"
 UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 MAX_PARALLEL="$THREADS"
 TIMEOUT=15
